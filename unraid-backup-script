@@ -1,0 +1,416 @@
+#!/bin/bash
+
+# ========= DEFAULT CONFIGURATIONS ========= #
+SSH_PORT="22"
+LOG_FILE="./logs/backup.log"
+MAX_LOG_SIZE=104857600  # 100 MB
+MAX_LOG_FILES=5
+VERBOSITY_LEVEL=0
+BOT_NAME='Backup Bot'
+
+# ========= TRAP HANDLERS ========= #
+trap 'echo "ERROR - Script interrupted. Exiting..."; exit 1' SIGINT SIGTERM
+
+# ========= FUNCTIONS ========= #
+
+# --- Helper Functions --- #
+
+# Display help message
+print_help() {
+    echo "Usage: $0 -w <WEBHOOK_URL> -r <REMOTE_SERVER> -s <BACKUP_SOURCE> -d <BACKUP_DESTINATION> -n <BACKUP_NAME> -p <SSH_PORT> -l <LOG_FILE> -v <VERBOSITY_LEVEL>"
+    echo
+    echo "Arguments:"
+    echo "  -w  WEBHOOK_URL         The webhook URL for notifications."
+    echo "  -r  REMOTE_SERVER       The remote server address."
+    echo "  -s  BACKUP_SOURCE       The source directory for backup."
+    echo "  -d  BACKUP_DESTINATION  The destination directory on the remote server."
+    echo "  -n  BACKUP_NAME         A name for the backup process."
+    echo "  -p  SSH_PORT            SSH port to use (default: 22)."
+    echo "  -l  LOG_FILE            Path to the log file (default: ./logs/backup.log)."
+    echo "  -v  VERBOSITY_LEVEL     Verbosity level (0 = minimal, 1 = normal, 2 = verbose). Default is 0."
+    echo "  -h                      Display this help message."
+    exit 1
+}
+
+# Rotate log files if they exceed the maximum size
+rotate_logs() {
+    if [ -f "$LOG_FILE" ]; then
+        local LOG_SIZE
+        LOG_SIZE=$(stat -c%s "$LOG_FILE")
+
+        if [ "$LOG_SIZE" -ge "$MAX_LOG_SIZE" ]; then
+            # Rotate log files
+            for ((i=MAX_LOG_FILES; i>=1; i--)); do
+                if [ -f "$LOG_FILE.$i" ]; then
+                    if [ "$i" -eq "$MAX_LOG_FILES" ]; then
+                        rm -f "$LOG_FILE.$i"
+                    else
+                        mv "$LOG_FILE.$i" "$LOG_FILE.$((i+1))"
+                    fi
+                fi
+            done
+
+            mv "$LOG_FILE" "$LOG_FILE.1"
+            touch "$LOG_FILE"
+        fi
+    fi
+}
+
+# Validate URL format
+validate_url() {
+    if ! [[ "$1" =~ ^https?:// ]]; then
+        echo "ERROR - Invalid URL: $1"
+        exit 1
+    fi
+}
+
+# Truncate output for Discord if it exceeds the character limit
+truncate_rsync_output() {
+    local OUTPUT=$1
+    local MAX_LENGTH=950  # Keep buffer for Discord's 2000 character limit
+    if [ "${#OUTPUT}" -gt "$MAX_LENGTH" ]; then
+        echo "${OUTPUT:0:$MAX_LENGTH}... (output truncated)"
+    else
+        echo "$OUTPUT"
+    fi
+}
+
+# Log messages with different verbosity levels
+log_message() {
+    local LOG_MSG=$1
+    local LOG_LEVEL=$2
+    local LOG_PREFIX="LOG"
+
+    rotate_logs
+
+    case $LOG_LEVEL in
+        0) LOG_PREFIX="ERROR" ;;
+        1) LOG_PREFIX="LOG" ;;
+        2) LOG_PREFIX="DEBUG" ;;
+    esac
+
+    if [ "$LOG_LEVEL" -le "$VERBOSITY_LEVEL" ]; then
+        printf "%s - %s - %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$LOG_PREFIX" "$LOG_MSG" | tee -a "$LOG_FILE"
+    fi
+}
+
+# --- Validation Functions --- #
+
+# Validate command-line arguments
+validate_arguments() {
+    validate_url "$WEBHOOK_URL"
+    
+    if [ ! -d "$BACKUP_SOURCE" ]; then
+        echo "ERROR - Backup source directory does not exist: $BACKUP_SOURCE"
+        exit 1
+    elif [ ! -r "$BACKUP_SOURCE" ]; then
+        echo "ERROR - Backup source directory is not readable."
+        exit 1
+    fi
+}
+
+# Check if required commands are available
+check_required_commands() {
+    for cmd in jq curl rsync; do
+        if ! command -v $cmd &>/dev/null; then
+            echo "ERROR - Required command $cmd not found."
+            exit 1
+        fi
+    done
+}
+
+# Check if required arguments are provided
+check_required_arguments() {
+  if [ -z "$WEBHOOK_URL" ] || [ -z "$REMOTE_SERVER" ] || [ -z "$BACKUP_SOURCE" ] || [ -z "$BACKUP_DESTINATION" ] || [ -z "$BACKUP_NAME" ]; then
+      echo "ERROR - Missing required arguments."
+      print_help
+  fi
+}
+
+# --- SSH Functions --- #
+
+# Check SSH connection and remote directory existence
+check_ssh_connection() {
+    log_message "Checking SSH connection to $REMOTE_SERVER on port $SSH_PORT..." 2
+
+    ssh -q -o BatchMode=yes -o ConnectTimeout=10 -p "$SSH_PORT" "$REMOTE_SERVER" exit
+    SSH_EXIT_CODE=$?
+
+    if [ $SSH_EXIT_CODE -ne 0 ]; then
+        notify_error "Unable to establish SSH connection to $REMOTE_SERVER on port $SSH_PORT."
+        exit 1
+    fi
+
+    log_message "SSH connection to $REMOTE_SERVER verified successfully." 2
+
+    log_message "Checking if the backup destination directory '$BACKUP_DESTINATION' exists on $REMOTE_SERVER..." 2
+    ssh -q -o BatchMode=yes -o ConnectTimeout=10 -p "$SSH_PORT" "$REMOTE_SERVER" "ls -d '$BACKUP_DESTINATION'" >/dev/null 2>&1
+    SSH_EXIT_CODE=$?
+
+    if [ $SSH_EXIT_CODE -ne 0 ]; then
+        notify_error "Backup destination directory '$BACKUP_DESTINATION' does not exist on $REMOTE_SERVER."
+        exit 1
+    fi
+
+    log_message "Backup destination directory '$BACKUP_DESTINATION' exists on $REMOTE_SERVER." 2
+}
+
+# --- Webhook Functions --- #
+
+# Send webhook with retry mechanism
+send_webhook() {
+    local PAYLOAD=$1
+    local MAX_RETRIES=3
+    local RETRY_DELAY=5
+
+    for ((i=1; i<=MAX_RETRIES; i++)); do
+        log_message "Sending webhook request (Attempt $i)." 2
+
+        if [ "$VERBOSITY_LEVEL" -eq 2 ]; then
+            log_message "JSON payload: $PAYLOAD" 2
+        fi
+
+        CURL_RESPONSE=$(curl --silent --show-error --location --write-out "HTTPSTATUS:%{http_code}" "$WEBHOOK_URL" --header 'Content-Type: application/json' --data "$PAYLOAD")
+        HTTP_BODY="${CURL_RESPONSE//HTTPSTATUS:*/}"
+        HTTP_STATUS=$(echo "$CURL_RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+        CURL_EXIT_CODE=$?
+
+        if [ $CURL_EXIT_CODE -eq 0 ] && { [ "$HTTP_STATUS" -eq 200 ] || [ "$HTTP_STATUS" -eq 204 ]; }; then
+            log_message "Webhook sent successfully." 2
+            return 0
+        fi
+
+        log_message "Webhook failed (Attempt $i): HTTP status $HTTP_STATUS, Response: $HTTP_BODY, cURL error code: $CURL_EXIT_CODE." 0
+        sleep $RETRY_DELAY
+    done
+
+    notify_error "Failed to send webhook after $MAX_RETRIES attempts. HTTP status: $HTTP_STATUS, cURL error code: $CURL_EXIT_CODE."
+    return 1
+}
+
+# Send start notification webhook
+notify_start() {
+    local THUMBNAIL_URL="https://cdn-icons-png.flaticon.com/512/1356/1356479.png"
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+
+    START_PAYLOAD=$(jq -n \
+        --arg username "$BOT_NAME" \
+        --arg backupSource "$BACKUP_SOURCE" \
+        --arg backupDestination "$REMOTE_SERVER:$BACKUP_DESTINATION" \
+        --arg backupName "$BACKUP_NAME" \
+        --arg thumbnailUrl "$THUMBNAIL_URL" \
+        --arg timestamp "$timestamp" \
+        '{
+          username: $username,
+          embeds: [
+            {
+              title: "**Backup Operation Started**",
+              description: "The backup process has been initiated. Please find the details below.",
+              color: 3447003,
+              author: {
+                name: ("📁 Backup: " + $backupName)
+              },
+              fields: [
+                {
+                  name: "🔹 **Source**",
+                  value: ("`" + $backupSource + "`"),
+                  inline: true
+                },
+                {
+                  name: "🔹 **Destination**",
+                  value: ("`" + $backupDestination + "`"),
+                  inline: true
+                },
+                {
+                  name: "🔹 **Status**",
+                  value: "🟢 *In Progress*"
+                }
+              ],
+              thumbnail: {
+                url: $thumbnailUrl
+              },
+              footer: {
+                text: ("Backup initiated by " + $username + " | ⏱️ " + $timestamp)
+              }
+            }
+          ]
+        }')
+
+    log_message "Starting backup for $BACKUP_NAME from $BACKUP_SOURCE to $BACKUP_DESTINATION." 1
+    send_webhook "$START_PAYLOAD"
+}
+
+# Send error notification webhook
+notify_error() {
+    local MESSAGE=$1
+    local THUMBNAIL_URL="https://cdn-icons-png.flaticon.com/512/4201/4201973.png"
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    local TRUNCATED_MESSAGE=$(truncate_rsync_output "$MESSAGE")
+
+    ERROR_PAYLOAD=$(jq -n \
+        --arg username "$BOT_NAME" \
+        --arg message "$TRUNCATED_MESSAGE" \
+        --arg backupSource "$BACKUP_SOURCE" \
+        --arg backupDestination "$REMOTE_SERVER:$BACKUP_DESTINATION" \
+        --arg backupName "$BACKUP_NAME" \
+        --arg thumbnailUrl "$THUMBNAIL_URL" \
+        --arg timestamp "$timestamp" \
+        '{
+          username: $username,
+          embeds: [
+            {
+              title: "**Error Occurred During Backup**",
+              description: "An error occurred during the backup process. Please review the details below.",
+              color: 16711680,
+              author: {
+                name: ("📁 Backup: " + $backupName)
+              },
+              fields: [
+                {
+                  name: "🔹 **Source**",
+                  value: ("`" + $backupSource + "`"),
+                  inline: true
+                },
+                {
+                  name: "🔹 **Destination**",
+                  value: ("`" + $backupDestination + "`"),
+                  inline: true
+                },
+                {
+                  name: "🔹 **Status**",
+                  value: "🔴 *Failed*"
+                },
+                {
+                  name: "🔹 **Error Message**",
+                  value: ("```\n" + $message + "\n```")
+                }
+              ],
+              thumbnail: {
+                url: $thumbnailUrl
+              },
+              footer: {
+                text: ("Backup initiated by " + $username + " | ⏱️ " + $timestamp)
+              }
+            }
+          ]
+        }')
+
+    log_message "Error: $MESSAGE" 0
+    send_webhook "$ERROR_PAYLOAD"
+}
+
+# --- Main Backup Function --- #
+
+# Perform the backup using rsync
+perform_backup() {
+    log_message "Running rsync command..." 2
+
+    if [ "$VERBOSITY_LEVEL" -ge 2 ]; then
+        RSYNC_OUTPUT=$(rsync --delete -ahz --stats --log-file="$LOG_FILE" --timeout=60 -e "ssh -p$SSH_PORT" "$BACKUP_SOURCE" "$REMOTE_SERVER:$BACKUP_DESTINATION" 2>&1)
+    else
+        RSYNC_OUTPUT=$(rsync --delete -ahz --stats --timeout=60 -e "ssh -p$SSH_PORT" "$BACKUP_SOURCE" "$REMOTE_SERVER:$BACKUP_DESTINATION" 2>&1)
+    fi
+
+    RSYNC_EXIT_CODE=$?
+
+    if [ $RSYNC_EXIT_CODE -ne 0 ]; then
+        handle_rsync_error "$RSYNC_EXIT_CODE"
+        return 1
+    fi
+
+    handle_backup_success
+}
+
+# Handle rsync errors
+handle_rsync_error() {
+    local EXIT_CODE=$1
+    notify_error "Failed to backup $BACKUP_SOURCE. Rsync error code: $EXIT_CODE"
+}
+
+# Handle successful backup
+handle_backup_success() {
+    log_message "Backup completed successfully." 1
+    local EMBED_COLOR=5832556
+    local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+    local TRUNCATED_RSYNC_OUTPUT=$(truncate_rsync_output "$RSYNC_OUTPUT")
+
+    JSON_PAYLOAD=$(jq -n \
+        --arg username "$BOT_NAME" \
+        --arg destination "$REMOTE_SERVER:$BACKUP_DESTINATION" \
+        --arg source "$BACKUP_SOURCE" \
+        --arg rsyncOutput "$TRUNCATED_RSYNC_OUTPUT" \
+        --arg thumbnailUrl "https://cdn-icons-png.flaticon.com/512/190/190411.png" \
+        --arg timestamp "$timestamp" \
+        --argjson embedColor "$EMBED_COLOR" \
+        '{
+            username: $username,
+            embeds: [
+                {
+                    title: "**Backup Completed Successfully**",
+                    description: "The backup operation has finished. Summary of the process is provided below.",
+                    color: $embedColor,
+                    fields: [
+                        {
+                            name: "🔹 **Source**",
+                            value: ("`" + $source + "`"),
+                            inline: true
+                        },
+                        {
+                            name: "🔹 **Destination**",
+                            value: ("`" + $destination + "`"),
+                            inline: true
+                        },
+                        {
+                            name: "🔹 **Status**",
+                            value: "🟢 *Completed*"
+                        },
+                        {
+                            name: "🗒️ **Rsync Output**",
+                            value: ("```" + $rsyncOutput + "```")
+                        }
+                    ],
+                    thumbnail: {
+                        url: $thumbnailUrl
+                    },
+                    footer: {
+                        text: ("Backup completed by " + $username + " | ⏱️ " + $timestamp)
+                    }
+                }
+            ]
+        }')
+
+    send_webhook "$JSON_PAYLOAD"
+}
+
+# ========= SCRIPT ENTRY POINT ========= #
+
+# Parse command-line arguments
+while getopts "w:r:s:d:n:p:l:v:h" opt; do
+    case $opt in
+        w) WEBHOOK_URL="$OPTARG" ;;
+        r) REMOTE_SERVER="$OPTARG" ;;
+        s) BACKUP_SOURCE="$OPTARG" ;;
+        d) BACKUP_DESTINATION="$OPTARG" ;;
+        n) BACKUP_NAME="$OPTARG" ;;
+        p) SSH_PORT="$OPTARG" ;;
+        l) LOG_FILE="$OPTARG" ;;
+        v) VERBOSITY_LEVEL="$OPTARG" ;;
+        h) print_help ;;
+        *) print_help ;;
+    esac
+done
+
+# Validate arguments and commands
+check_required_commands
+check_required_arguments
+validate_arguments
+
+# Check SSH connection
+check_ssh_connection
+
+# Start the backup process
+notify_start
+perform_backup
+
+# Add a newline to the log file
+printf "\n" >> "$LOG_FILE"
